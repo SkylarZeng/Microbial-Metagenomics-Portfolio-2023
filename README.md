@@ -1,4 +1,4 @@
-# Microbial Metagenomics Thesis Portfolio
+# Microbial Metagenomics Portfolio
 
 This repository packages a representative undergraduate research project in microbial metagenomics into a GitHub-friendly format. It combines the original lab notebook export, reconstructed analysis scripts, result figures, and thesis documents so a reviewer can quickly see both the coding work and the scientific outcome.
 
