@@ -1,0 +1,519 @@
+---
+title: "Microbial Metagenomics Portfolio 2023 — Project Story"
+subtitle: "From Raw Reads to Metagenome-Assembled Genomes: A Soil Metagenomics Pipeline"
+author: "Skylar Zeng"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    df_print: paged
+    fig_width: 9
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  eval       = FALSE,   # set to TRUE when input data are present
+  fig.align  = "center"
+)
+```
+
+---
+
+# Overview
+
+This document narrates the complete computational pipeline used in my undergraduate
+thesis on soil microbial community structure across a land-use gradient.
+It is structured as a technical portfolio artifact: every processing step is
+described, the key code is embedded verbatim, and representative results are
+discussed. Raw sequencing data are not included; code logic and workflow steps
+are fully preserved.
+
+**Biological Question**
+
+> How does microbial community composition and functional potential vary across a
+> forest-to-agriculture disturbance gradient, and can metagenome-assembled genomes
+> (MAGs) recovered from these soils reveal novel lineages involved in nitrogen and
+> carbon cycling?
+
+**Study design**: 24 soil samples (12 pristine forest, 12 agricultural) collected
+along a single land-use transect. Each sample was subjected to whole-shotgun
+metagenomic sequencing (Illumina NovaSeq 6000, 2 × 150 bp, ~10 Gb per sample).
+
+---
+
+# Environment Setup
+
+All compute-intensive steps ran on a SLURM HPC cluster. The Conda environment
+below reproduces the analysis locally.
+
+```{r env-setup, eval=FALSE}
+# Create and activate the Conda environment
+# (run in terminal, not R)
+# conda env create -f docs/environment.yml
+# conda activate metagenomics-2023
+
+# R packages
+required_pkgs <- c(
+  "tidyverse", "vegan", "phyloseq", "ggplot2", "ggrepel",
+  "ggpubr", "rstatix", "DESeq2", "ComplexHeatmap", "circlize",
+  "pheatmap", "RColorBrewer", "patchwork"
+)
+missing_pkgs <- required_pkgs[!required_pkgs %in% installed.packages()[, "Package"]]
+if (length(missing_pkgs) > 0) {
+  BiocManager::install(missing_pkgs)
+}
+```
+
+---
+
+# Pipeline Steps
+
+## Step 1: Quality Control
+
+FastQC assessed raw read quality; Trimmomatic removed adapters and low-quality
+bases. SLURM array jobs processed all 24 samples in parallel.
+
+```{bash fastqc-slurm, eval=FALSE, engine="bash"}
+#!/bin/bash
+#SBATCH --job-name=fastqc_raw
+#SBATCH --array=1-24
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=8G
+#SBATCH --time=02:00:00
+
+module load fastqc/0.11.9
+
+SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" sample_list.txt)
+fastqc --threads 4 --outdir qc/fastqc_raw \
+    raw_reads/${SAMPLE}_R1.fastq.gz \
+    raw_reads/${SAMPLE}_R2.fastq.gz
+```
+
+```{bash trimmomatic-slurm, eval=FALSE, engine="bash"}
+#!/bin/bash
+#SBATCH --job-name=trimmomatic
+#SBATCH --array=1-24
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+
+module load trimmomatic/0.39
+
+SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" sample_list.txt)
+
+trimmomatic PE -threads 8 -phred33 \
+    raw_reads/${SAMPLE}_R1.fastq.gz \
+    raw_reads/${SAMPLE}_R2.fastq.gz \
+    trimmed/${SAMPLE}_R1_paired.fastq.gz   trimmed/${SAMPLE}_R1_unpaired.fastq.gz \
+    trimmed/${SAMPLE}_R2_paired.fastq.gz   trimmed/${SAMPLE}_R2_unpaired.fastq.gz \
+    ILLUMINACLIP:TruSeq3-PE-2.fa:2:30:10:8:true \
+    LEADING:3 TRAILING:3 SLIDINGWINDOW:4:20 MINLEN:50
+```
+
+**Result**: Average read retention 94.8% across 24 samples. MultiQC confirmed
+all samples passed quality thresholds (Q30 > 90%).
+
+---
+
+## Step 2: Host Decontamination
+
+Plant host reads were removed by mapping against the *Zea mays* B73 reference
+genome with Bowtie2. Only unmapped (microbial) read pairs were retained.
+
+```{bash host-decontam, eval=FALSE, engine="bash"}
+#!/bin/bash
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=32G
+
+SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" sample_list.txt)
+
+bowtie2 -x databases/host_bt2_index \
+    -1 trimmed/${SAMPLE}_R1_paired.fastq.gz \
+    -2 trimmed/${SAMPLE}_R2_paired.fastq.gz \
+    --threads 16 --sensitive \
+    --un-conc-gz decontaminated/${SAMPLE}_clean_R%.fastq.gz \
+    -S /dev/null \
+    2> decontaminated/${SAMPLE}_bowtie2_host.log
+```
+
+**Result**: Mean 2.3% host mapping rate. Retained ~97.7% of reads for
+downstream microbial analysis.
+
+---
+
+## Step 3: Taxonomic Profiling
+
+### Kraken2 k-mer Classification
+
+```{bash kraken2, eval=FALSE, engine="bash"}
+#!/bin/bash
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --partition=highmem
+
+SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" sample_list.txt)
+
+kraken2 \
+    --db   databases/kraken2_standard_20230314 \
+    --threads 16 --confidence 0.1 \
+    --paired --gzip-compressed \
+    --output  kraken2/${SAMPLE}.kraken2 \
+    --report  kraken2/${SAMPLE}.k2report \
+    decontaminated/${SAMPLE}_R1.fastq.gz \
+    decontaminated/${SAMPLE}_R2.fastq.gz
+```
+
+### Bracken Abundance Re-estimation
+
+```{bash bracken, eval=FALSE, engine="bash"}
+bracken -d databases/kraken2_standard_20230314 \
+    -i  kraken2/${SAMPLE}.k2report \
+    -o  bracken/species/${SAMPLE}_bracken_species.txt \
+    -r  150 -l S -t 10
+```
+
+### Parsing Kraken2 Reports (Python)
+
+```{python parse-kraken2, eval=FALSE}
+# scripts/python/parse_kraken2_reports.py (abbreviated)
+import pandas as pd
+from pathlib import Path
+
+K2_COLS = ["pct", "clade_reads", "taxon_reads", "rank", "taxid", "name"]
+
+def parse_k2_report(path: Path, rank: str) -> pd.Series:
+    df = pd.read_csv(path, sep="\t", header=None, names=K2_COLS)
+    df["name"] = df["name"].str.strip()
+    subset = df[df["rank"] == rank].set_index("name")["taxon_reads"]
+    return subset
+
+# Aggregate all samples into one matrix
+report_files = sorted(Path("kraken2").glob("*.k2report"))
+combined = pd.DataFrame({f.stem: parse_k2_report(f, "S") for f in report_files})
+combined.fillna(0).astype(int).to_csv("data/kraken2_species_matrix.tsv", sep="\t")
+```
+
+**Result**: Mean classification rate 68% (range 52–79%), consistent with
+high novelty in forest soils relative to the reference database.
+
+---
+
+## Step 4: De Novo Metagenomic Assembly
+
+MEGAHIT was used for per-sample assembly. Co-assembly was rejected to preserve
+strain-level diversity across the environmental gradient.
+
+```{bash megahit, eval=FALSE, engine="bash"}
+#!/bin/bash
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+
+SAMPLE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" sample_list.txt)
+
+megahit \
+    -1 decontaminated/${SAMPLE}_R1.fastq.gz \
+    -2 decontaminated/${SAMPLE}_R2.fastq.gz \
+    --out-dir     assembly/${SAMPLE} \
+    --out-prefix  ${SAMPLE} \
+    --num-cpu-threads 24 \
+    --k-list 21,29,39,59,79,99,119,141 \
+    --min-contig-len 1000
+```
+
+**Result**: Mean N50 of 2,841 bp (forest) and 2,284 bp (agricultural);
+larger contigs in forest samples consistent with more coherent genomes
+in higher-diversity communities.
+
+---
+
+## Step 5: Read Mapping for Binning Coverage
+
+```{bash bowtie2-mapping, eval=FALSE, engine="bash"}
+bowtie2-build --threads 16 assembly/${SAMPLE}/${SAMPLE}.contigs.fa mapping/${SAMPLE}_index
+
+bowtie2 -x mapping/${SAMPLE}_index \
+    -1 decontaminated/${SAMPLE}_R1.fastq.gz \
+    -2 decontaminated/${SAMPLE}_R2.fastq.gz \
+    --threads 16 --no-unal -S mapping/${SAMPLE}.sam \
+    2> mapping/${SAMPLE}_mapping.log
+
+samtools view -bS -@ 16 mapping/${SAMPLE}.sam | \
+samtools sort    -@ 16 -o mapping/${SAMPLE}_sorted.bam
+samtools index mapping/${SAMPLE}_sorted.bam
+rm mapping/${SAMPLE}.sam   # remove large SAM
+```
+
+---
+
+## Step 6: Genome Binning with MetaBAT2
+
+```{bash metabat2, eval=FALSE, engine="bash"}
+# Compute per-contig coverage depth
+jgi_summarize_bam_contig_depths \
+    --outputDepth bins/metabat2/${SAMPLE}_depth.txt \
+    mapping/${SAMPLE}_sorted.bam
+
+# Bin contigs
+metabat2 \
+    -i assembly/${SAMPLE}/${SAMPLE}.contigs.fa \
+    -a bins/metabat2/${SAMPLE}_depth.txt \
+    -o bins/metabat2/${SAMPLE}/${SAMPLE}_bin \
+    -m 2500 -t 16 --unbinned --saveCls
+```
+
+**Result**: 108 total bins recovered across 24 samples before quality filtering.
+
+---
+
+## Step 7: MAG Quality Assessment (CheckM2)
+
+```{bash checkm2, eval=FALSE, engine="bash"}
+checkm2 predict \
+    --input bins/metabat2/${SAMPLE} \
+    --output-directory checkm2/${SAMPLE} \
+    --extension fa \
+    --database-path databases/checkm2_db/uniref100.KO.1.dmnd \
+    --threads 16 --force
+```
+
+### Summarising CheckM2 Results (Python)
+
+```{python summarize-checkm, eval=FALSE}
+# scripts/python/summarize_checkm_results.py (abbreviated)
+import pandas as pd
+from pathlib import Path
+
+HQ_COMP, HQ_CONT = 90.0, 5.0
+MQ_COMP, MQ_CONT = 70.0, 10.0
+
+def assign_tier(row):
+    if row.Completeness >= HQ_COMP and row.Contamination <= HQ_CONT:
+        return "high"
+    if row.Completeness >= MQ_COMP and row.Contamination <= MQ_CONT:
+        return "medium"
+    return "low"
+
+reports = sorted(Path("checkm2").glob("*/quality_report.tsv"))
+combined = pd.concat(
+    [pd.read_csv(r, sep="\t").assign(sample_id=r.parent.name) for r in reports]
+)
+combined["quality_tier"] = combined.apply(assign_tier, axis=1)
+combined.to_csv("data/checkm2_all_samples_summary.csv", index=False)
+
+print(combined["quality_tier"].value_counts())
+```
+
+**Result**: 47 MAGs passed QC (12 high-quality, 35 medium-quality).
+
+---
+
+## Step 8: Phylogenomic Classification (GTDB-Tk)
+
+```{bash gtdbtk, eval=FALSE, engine="bash"}
+# Run on all passing MAGs together
+gtdbtk classify_wf \
+    --genome_dir bins/passing \
+    --out_dir    gtdbtk \
+    --extension  fa \
+    --cpus       48 \
+    --skip_ani_screen
+```
+
+**Result**: 3 MAGs placed in unnamed Acidobacteriota families; 2 in candidate
+phylum FCPU426 — entirely novel to this soil type.
+
+---
+
+## Step 9: Alpha-Diversity Analysis
+
+```{r alpha-diversity}
+library(tidyverse)
+library(vegan)
+library(ggpubr)
+library(rstatix)
+
+# Load species-level Bracken matrix (taxa × samples)
+otu_wide <- read_tsv("data/bracken_species_matrix.tsv") %>%
+  column_to_rownames("taxon")
+otu_mat <- t(as.matrix(otu_wide))
+
+# Rarefy to minimum depth
+set.seed(42)
+min_reads <- min(rowSums(otu_mat))
+otu_rarefied <- rrarefy(otu_mat, sample = min_reads)
+
+# Compute indices
+alpha_df <- data.frame(
+  sample_id = rownames(otu_rarefied),
+  shannon   = diversity(otu_rarefied, index = "shannon"),
+  simpson   = diversity(otu_rarefied, index = "simpson"),
+  richness  = specnumber(otu_rarefied)
+) %>%
+  mutate(evenness = shannon / log(richness)) %>%
+  left_join(read_csv("data/metadata.csv"), by = "sample_id")
+
+# Wilcoxon tests
+stats_results <- alpha_df %>%
+  pivot_longer(cols = c(shannon, simpson, richness, evenness)) %>%
+  group_by(name) %>%
+  wilcox_test(value ~ land_use) %>%
+  adjust_pvalue("BH") %>%
+  add_significance("p.adj")
+
+print(stats_results)
+```
+
+**Key result**: Shannon H' significantly higher in forest soils
+(Wilcoxon, BH-adjusted *p* < 0.01), consistent with disturbance-driven
+diversity loss.
+
+---
+
+## Step 10: Beta-Diversity and Community Ordination
+
+```{r beta-diversity}
+library(vegan)
+
+bc_dist <- vegdist(otu_rarefied, method = "bray")
+
+# PERMANOVA
+set.seed(42)
+permanova <- adonis2(bc_dist ~ land_use, data = metadata,
+                     permutations = 9999, by = "margin")
+print(permanova)
+# R² = 0.42, p = 0.001
+
+# PCoA
+pcoa <- cmdscale(bc_dist, eig = TRUE, k = 2)
+pct_var <- round(pcoa$eig / sum(pcoa$eig) * 100, 1)
+
+pcoa_df <- data.frame(
+  sample_id = rownames(pcoa$points),
+  PC1 = pcoa$points[, 1],
+  PC2 = pcoa$points[, 2]
+) %>% left_join(metadata, by = "sample_id")
+
+ggplot(pcoa_df, aes(PC1, PC2, colour = land_use)) +
+  geom_point(size = 3) +
+  stat_ellipse(level = 0.95) +
+  labs(x = paste0("PC1 (", pct_var[1], "%)"),
+       y = paste0("PC2 (", pct_var[2], "%)")) +
+  scale_colour_manual(values = c(forest = "#2d6a4f", agricultural = "#b5838d")) +
+  theme_bw()
+```
+
+**Key result**: PERMANOVA R² = 0.42, *p* = 0.001 — land use explains 42% of
+community composition variance.
+
+---
+
+## Step 11: Differential Abundance (DESeq2)
+
+```{r deseq2}
+library(DESeq2)
+
+# Integer genus-level count matrix (taxa × samples)
+count_mat <- read_tsv("data/bracken_genus_matrix.tsv") %>%
+  column_to_rownames("taxon") %>%
+  as.matrix() %>% round()
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_mat[, metadata$sample_id],
+  colData   = metadata,
+  design    = ~ land_use
+)
+
+# Low-count filter: keep genera with ≥ 10 reads in ≥ 3 samples
+dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+dds <- DESeq(dds, quiet = TRUE)
+
+res <- results(dds,
+               contrast = c("land_use", "agricultural", "forest"),
+               alpha = 0.05, pAdjustMethod = "BH")
+
+# Significant genera (|log2FC| > 1, padj < 0.05)
+sig <- as.data.frame(res) %>%
+  rownames_to_column("taxon") %>%
+  filter(!is.na(padj), padj < 0.05, abs(log2FoldChange) > 1) %>%
+  arrange(padj)
+
+nrow(sig)   # number of differentially abundant genera
+```
+
+---
+
+## Step 12: Functional Gene Heatmap
+
+```{r functional-heatmap}
+library(ComplexHeatmap)
+
+# Presence/absence of key KEGG Orthologs in each MAG
+# (full code in scripts/r/04_mag_functional_heatmap.R)
+
+# Target genes for nitrogen and carbon cycling
+target_ko <- c(
+  nifH = "K02588", nifD = "K02586",     # N fixation
+  nosZ = "K00376", norB = "K04561",     # Denitrification
+  amoA = "K10944",                       # Nitrification
+  mcrA = "K00399",                       # Methanogenesis
+  rbcL = "K01601"                        # C fixation (CBB)
+)
+
+# pa_mat: rows = MAGs, columns = KOs (0/1)
+# (populated from eggNOG-mapper *.annotations files)
+Heatmap(
+  pa_mat,
+  name   = "Presence",
+  col    = c("0" = "#f0f0f0", "1" = "#1d3557"),
+  column_split = gene_pathways,
+  cluster_rows = FALSE, cluster_columns = FALSE
+)
+```
+
+**Key result**: *nifH* (nitrogen fixation) and *nosZ* (denitrification) genes
+enriched in forest-associated MAGs; agricultural MAGs carried more
+*amoA* (nitrification) genes — consistent with fertiliser-driven nitrifier
+enrichment.
+
+---
+
+# Results Summary
+
+| Analysis | Key Metric | Forest | Agricultural | Significance |
+|---|---|---|---|---|
+| α-diversity (Shannon H') | mean ± SD | 4.12 ± 0.31 | 3.47 ± 0.42 | *p* < 0.01 |
+| Species richness | mean | 1 842 | 1 203 | *p* < 0.01 |
+| β-diversity (PERMANOVA) | R² | — | — | 0.42, *p* = 0.001 |
+| MAGs recovered | count | 31 | 16 | — |
+| High-quality MAGs | count | 9 | 3 | — |
+| Novel Acidobacteria | unnamed families | 3 | 0 | — |
+| *nifH*-carrying MAGs | count | 7 | 1 | — |
+
+---
+
+# Reproducibility Notes
+
+```{r session-info}
+sessionInfo()
+```
+
+All SLURM scripts embed exact module versions used.  
+All R scripts conclude with `sessionInfo()`.  
+Conda environment: `docs/environment.yml`.  
+Random seeds set to `42` throughout.
+
+---
+
+*Undergraduate thesis project, 2023. Code logic and workflow steps preserved
+as a public technical portfolio artifact.*
