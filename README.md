@@ -2,7 +2,7 @@
 
 This repository packages a representative undergraduate research project in microbial metagenomics into a GitHub-friendly format. It combines the original lab notebook export, reconstructed analysis scripts, result figures, and thesis documents so a reviewer can quickly see both the coding work and the scientific outcome.
 
-If you want the entire process and code in one reviewer-friendly document, start with `PROJECT_STORY.Rmd`.
+If you want the entire process and code in one reviewer-friendly document, start with `PROJECT_OUTLINE.Rmd`.
 
 ## Project Focus
 
